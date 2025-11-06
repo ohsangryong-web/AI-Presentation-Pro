@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+.env
+
+# User-generated files
+output.avi
+output.wav
+score_history.json
+
+# OS generated files
+.DS_Store
