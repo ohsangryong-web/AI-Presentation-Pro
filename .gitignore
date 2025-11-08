@@ -10,6 +10,22 @@ venv/
 output.avi
 output.wav
 score_history.json
+keys.json
 
 # OS generated files
 .DS_Store
+# Python
+__pycache__/
+*.pyc
+
+# 생성된 미디어 파일
+*.avi
+*.wav
+
+# 설정 및 민감 정보
+config.json
+.env
+
+# 로그 및 기록
+history.json
+*.log
