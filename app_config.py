@@ -7,11 +7,21 @@ import json
 def set_korean_font():
     """Matplotlib 한글 폰트 설정"""
     try:
+        # 윈도우
         font_path = "C:/Windows/Fonts/malgun.ttf"
         font = font_manager.FontProperties(fname=font_path).get_name()
         rc('font', family=font)
-    except:
-        print("한글 폰트(malgun.ttf)를 찾을 수 없습니다. 그래프의 한글이 깨질 수 있습니다.")
+    except Exception as e:
+        print(f"한글 폰트(malgun.ttf)를 찾을 수 없습니다. (오류: {e})")
+        try:
+            # macOS
+            font_path = "/Library/Fonts/AppleGothic.ttf"
+            font = font_manager.FontProperties(fname=font_path).get_name()
+            rc('font', family=font)
+        except Exception as e_mac:
+            print(f"AppleGothic 폰트도 찾을 수 없습니다. (오류: {e_mac})")
+            print("그래프의 한글이 깨질 수 있습니다.")
+
 
 # --- API 키 로드/저장 함수 (Gemini 전용) ---
 KEYS_FILE = "keys.json"
@@ -21,17 +31,21 @@ def load_api_keys():
     if not os.path.exists(KEYS_FILE):
         return None
     try:
-        with open(KEYS_FILE, "r") as f:
+        with open(KEYS_FILE, "r", encoding='utf-8') as f:
             keys = json.load(f)
             return keys.get("GEMINI_API_KEY")
-    except:
+    except json.JSONDecodeError:
+        print(f"오류: {KEYS_FILE} 파일 형식이 잘못되었습니다.")
+        return None
+    except Exception as e:
+        print(f"API 키 로드 실패: {e}")
         return None
 
 def save_api_keys(gemini_key):
     """GEMINI_API_KEY를 keys.json 파일에 저장합니다."""
     keys = { "GEMINI_API_KEY": gemini_key }
     try:
-        with open(KEYS_FILE, "w") as f:
+        with open(KEYS_FILE, "w", encoding='utf-8') as f:
             json.dump(keys, f, indent=4)
     except Exception as e:
         print(f"API 키 저장 실패: {e}")
@@ -59,11 +73,13 @@ COACHING_CONFIG = {
 }
 
 # --- 전역 상수 ---
-FILLER_WORDS = ['어', '음', '그', '뭐', '막', '이제', '좀', '그러니까', '일단']
+FILLER_WORDS = ['어', '음', '그', '뭐', '막', '이제', '좀', '그러니까', '일단', '한']
 BACKUP_QUESTIONS = [
     "해당 주장의 핵심 근거는 무엇인가요?",
-    "예상되는 가장 큰 리스크는?",
-    "경쟁사 대비 차별점은?"
+    "예상되는 가장 큰 리스크는 무엇인가요?",
+    "경쟁사 대비 가장 차별화되는 강점은 무엇인가요?",
+    "이 아이디어를 한 문장으로 요약한다면 무엇인가요?",
+    "청중이 꼭 기억해야 할 단 한 가지는 무엇인가요?"
 ]
 HISTORY_FILE = "score_history.json"
 STOPWORDS = set([
