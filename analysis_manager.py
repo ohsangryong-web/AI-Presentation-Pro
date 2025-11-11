@@ -1,7 +1,6 @@
 import re
 import numpy as np
 from collections import Counter
-# IMRADValidator를 question_generator에서 임포트
 from question_generator import IMRADValidator 
 
 class AnalysisManager:
