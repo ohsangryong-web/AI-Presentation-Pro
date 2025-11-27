@@ -1,14 +1,17 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from tkinter import simpledialog # API 키를 물어볼 팝업창
+from tkinter import simpledialog 
 import cv2
 from PIL import Image, ImageTk
 import threading
 import time
-import speech_recognition as sr
 import numpy as np
+
+# [중요] 반드시 다른 matplotlib import보다 위에 있어야 함
+import matplotlib
+matplotlib.use('TkAgg') 
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker # [수정] 그래프 정수 눈금용
+import matplotlib.ticker as ticker
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import random
 import os
@@ -17,47 +20,101 @@ import re
 import pyaudio
 import wave
 import audioop
+import sys
+import queue
+import contextlib 
+import difflib 
+import math 
+
+# [필수] MediaPipe
+import mediapipe as mp
+
+# [필수] Whisper (고성능 분석)
+from faster_whisper import WhisperModel
+
+# [필수] Vosk (실시간)
+from vosk import Model, KaldiRecognizer
+
+def resource_path(relative_path):
+    try:
+        # PyInstaller가 생성한 임시 폴더 경로 (.exe 실행 시)
+        base_path = sys._MEIPASS
+    except Exception:
+        # 평소 개발 환경 (.py 실행 시)
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 
 try:
-    import app_config # 설정 파일 (app_config.py)
+    import app_config 
     from question_generator import DynamicQuestionGenerator, IMRADValidator
     from analysis_manager import AnalysisManager
     from ai_rewriter import AI_Announcer 
 except ImportError as e:
     print(f"경고: 필요한 모듈을 찾을 수 없습니다: {e}")
-    print("app_config.py, question_generator.py, analysis_manager.py, ai_rewriter.py 파일이 main.py와 같은 폴더에 있는지 확인하세요.")
-    # 임시 대체 (오류 방지용)
     class DynamicQuestionGenerator: 
-        def __init__(self, *args): pass # [수정] text_model 인수 받도록
+        def __init__(self, *args): pass 
     class IMRADValidator: 
-        def __init__(self, *args): pass # [수정] text_model 인수 받도록
+        def __init__(self, *args): pass 
     class AnalysisManager: 
         def __init__(self, *args): pass
     class AI_Announcer: 
         def __init__(self, *args): pass
-# --- ---
 
-# --- 전역 변수 (실시간 스레드 제어용) ---
+# --- 전역 변수 설정 ---
 is_recording = False
 start_time = 0
 speech_data = {"full_transcript": "", "word_count": 0, "filler_count": 0}
-gaze_data = {"total_frames": 0, "looking_frames": 0}
+gaze_data = {"total_frames": 0, "looking_frames": 0, "script_frames": 0} # script_frames 추가
 audio_data = {"volumes": [], "tremble_count": 0}
 timeline_markers = []
 cap = None
 out = None
-recognizer = sr.Recognizer()
-microphone = sr.Microphone()
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-pa = pyaudio.PyAudio() # .wav 저장을 위해 pa 인스턴스는 유지
+pa = pyaudio.PyAudio()
+
+# MediaPipe 초기화
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True, # 눈동자(Iris) 추적을 위해 필수
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# 얼굴 인식 최적화 변수
+current_face_box = None
+frame_count = 0
+
+# --- mainFinal.py 수정할 부분 ---
+
+vosk_model = None
+try:
+    # 1순위: 가장 단순한 방법 (잘 되는 코드의 방식)
+    if os.path.exists("model"):
+        vosk_model = Model("model")
+        print("✅ Vosk 오프라인 모델 로드 완료! (상대 경로)")
+        
+    # 2순위: 만약 위 방법이 안 되면 resource_path 사용 (PyInstaller 등 대비)
+    else:
+        model_path = resource_path("model")
+        if os.path.exists(model_path):
+            vosk_model = Model(model_path)
+            print(f"✅ Vosk 오프라인 모델 로드 완료! (절대 경로): {model_path}")
+        else:
+            print(f"⚠️ 경고: 모델 경로를 찾을 수 없습니다.")
+
+except Exception as e:
+    print(f"❌ Vosk 모델 로드 오류: {e}")
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI Presentation Pro (Gemini Full Version)")
-        self.geometry("1200x950")
+        self.title("AI Presentation Pro (Final Ver: Enhanced UI & Gaze)")
+        self.geometry("1400x950") # 화면을 좀 더 넓게 설정
         
-        # app_config 모듈이 로드되었는지 확인 후 폰트 설정
+        # 긴장 모드 상태 변수
+        self.is_anxious = False
+        self.heart_phase = 0.0
+        
         if 'app_config' in globals() and hasattr(app_config, 'set_korean_font'):
             app_config.set_korean_font() 
         
@@ -66,33 +123,28 @@ class App(tk.Tk):
         self.style = ttk.Style()
         self.style.theme_use('clam')
         
-        self.load_and_initialize_apis() # Gemini API 로드
+        self.load_and_initialize_apis() 
         
-        # 모듈이 정상 로드되었을 때만 인스턴스 생성
         if 'app_config' in globals() and hasattr(app_config, 'STOPWORDS'):
             self.analysis_manager = AnalysisManager(app_config.STOPWORDS, app_config.COACHING_CONFIG)
             self.dynamic_generator = DynamicQuestionGenerator(self.text_model) 
             self.imrad_validator = IMRADValidator(self.text_model)
             self.ai_announcer = AI_Announcer(self.text_model) 
         else:
-            # 모듈 로드 실패 시 비상용 인스턴스 (오류 방지)
             self.analysis_manager = AnalysisManager({}, {})
             self.dynamic_generator = DynamicQuestionGenerator(None)
             self.imrad_validator = IMRADValidator(None)
             self.ai_announcer = AI_Announcer(None)
 
         self.extracted_keywords = []
+        self.raw_audio_frames = []
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.load_history()
         self.show_setup_page()
 
     def load_and_initialize_apis(self):
-        """[수정] Gemini API 키로 텍스트 모델만 초기화합니다. (TTS 모델 초기화 삭제)"""
-        
-        # app_config 모듈이 로드되었는지 확인
         if 'app_config' not in globals() or not hasattr(app_config, 'load_api_keys'):
-            messagebox.showerror("치명적 오류", "app_config 모듈을 로드할 수 없습니다.")
             self.AI_AVAILABLE = False
             self.text_model = None
             return
@@ -101,53 +153,39 @@ class App(tk.Tk):
         
         if not gemini_key:
             gemini_key = simpledialog.askstring("Gemini API 키 필요", 
-                                                "Gemini API 키를 입력하세요 (모든 AI 기능에 사용):\n", 
+                                                "Gemini API 키를 입력하세요 (AI 피드백용):\n", 
                                                 parent=self)
             if gemini_key:
-                app_config.save_api_keys(gemini_key) # Gemini 키만 저장
+                app_config.save_api_keys(gemini_key)
 
-        self.text_model = None  # (MODIFIED) 텍스트 모델
+        self.text_model = None
         self.AI_AVAILABLE = False
 
         if gemini_key:
             try:
-                # [수정] app_config 모듈에 있는 genai 사용
                 if 'app_config' in globals() and hasattr(app_config, 'genai'):
                     app_config.genai.configure(api_key=gemini_key)
-                    
-                    # (FIXED) 1. 텍스트 모델 (gemini-2.5-pro)
                     self.text_model = app_config.genai.GenerativeModel('gemini-2.5-pro')
-                    
                     self.AI_AVAILABLE = True
-                    
-                    print("Gemini API가 성공적으로 설정되었습니다. (Text: gemini-2.5-pro)")
-                else:
-                    raise ImportError("app_config 모듈에서 genai를 찾을 수 없습니다.")
-            
+                    print("Gemini API 연결 성공")
             except Exception as e:
-                print(f"Gemini API 설정 실패: {e}")
-                messagebox.showerror("API 오류", f"Gemini 모델 초기화 실패. API 키를 확인하세요.\n{e}")
+                print(f"Gemini 연결 실패: {e}")
         else:
-            print("Gemini API 키가 설정되지 않았습니다. AI 기능이 비활성화됩니다.")
-
+            print("Gemini API 키 없음.")
 
     def on_closing(self):
         global is_recording, cap, out, pa
         is_recording = False
+        self.is_anxious = False 
         if cap and cap.isOpened(): cap.release()
         if out: out.release()
         if pa: pa.terminate() 
         try:
-            if os.path.exists("rewritten_script_output.wav"):
-                os.remove("rewritten_script_output.wav")
-            if os.path.exists("output.avi"):
-                os.remove("output.avi")
-            if os.path.exists("output.wav"):
-                os.remove("output.wav")
-                
+            for f in ["rewritten_script_output.wav", "output.avi", "output.wav"]:
+                if os.path.exists(f): os.remove(f)
         except: pass
         self.destroy()
-        os._exit(0) # 스레드가 남아있을 수 있으므로 강제 종료
+        os._exit(0)
 
     def load_history(self):
         self.history = []
@@ -160,7 +198,6 @@ class App(tk.Tk):
     def save_history(self, score):
         if 'app_config' not in globals() or not hasattr(app_config, 'HISTORY_FILE'): return
         self.history.append(score)
-        #utf-8 인코딩 추가 (한글 깨짐 방지)
         with open(app_config.HISTORY_FILE, "w", encoding='utf-8') as f:
             json.dump(self.history, f, ensure_ascii=False, indent=4)
 
@@ -183,360 +220,565 @@ class App(tk.Tk):
         ttk.Button(frame, text="📢 AI 대본 재작성 (Gemini)", command=self.show_rewriter_window).pack(pady=10, ipadx=10, ipady=5)
 
     def go_to_practice(self):
-        """연습 페이지로 이동"""
         self.user_settings['atmosphere'] = self.atmosphere_var.get()
         self.show_practice_page()
 
+    # =========================================================================
+    # [UI 대규모 수정] 화면 상단: 청중/내얼굴 병렬 배치, 하단: 대본 스크롤
+    # =========================================================================
     def show_practice_page(self):
         self.clear_window()
+        
+        # 전체 메인 프레임
         main_frame = ttk.Frame(self)
         main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+
+        # --- 상단 영역: 화면 분할 (청중 | 내 얼굴) ---
         top_frame = ttk.Frame(main_frame)
-        top_frame.pack(pady=10)
-        self.video_panel = ttk.Label(top_frame)
-        self.video_panel.pack()
-        self.audience_frame = tk.Frame(main_frame, bg="#e9ecef", bd=2, relief="sunken")
-        self.audience_frame.pack(fill="x", padx=100, pady=10)
-        self.aud_labels = [ttk.Label(self.audience_frame) for _ in range(2)]
-        for lbl in self.aud_labels: lbl.pack(side="left", expand=True, padx=10, pady=10)
-        self.update_audience_images('default', 'default') # [수정] 청중 이미지 로드
+        top_frame.pack(side='top', fill='both', expand=True, pady=(0, 10))
+        
+        # 상단 그리드 설정 (1행 2열, 균등 비율)
+        top_frame.columnconfigure(0, weight=1) # 청중 영역
+        top_frame.columnconfigure(1, weight=1) # 내 얼굴 영역
+        top_frame.rowconfigure(0, weight=1)
+
+        # 1. 청중 패널 (왼쪽)
+        self.audience_frame = tk.Frame(top_frame, bg="#e9ecef", bd=2, relief="sunken")
+        self.audience_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        # 청중 이미지가 중앙에 오도록 내부 프레임 사용
+        aud_inner = tk.Frame(self.audience_frame, bg="#e9ecef")
+        aud_inner.pack(expand=True)
+        self.aud_labels = [ttk.Label(aud_inner) for _ in range(2)]
+        for lbl in self.aud_labels: lbl.pack(side="left", padx=5)
+
+        # 2. 내 얼굴 패널 (오른쪽)
+        video_bg_frame = tk.Frame(top_frame, bg="black", bd=2, relief="sunken")
+        video_bg_frame.grid(row=0, column=1, sticky="nsew")
+        
+        self.video_panel = ttk.Label(video_bg_frame)
+        self.video_panel.pack(expand=True)
+
+        # 초기 청중 이미지 설정
+        self.update_audience_images('default', 'default') 
+        
+        # --- 중단 영역: 컨트롤 버튼 ---
         control_frame = ttk.Frame(main_frame)
-        control_frame.pack(pady=20)
-        self.btn_start = ttk.Button(control_frame, text="▶ 녹화 시작", command=self.start_recording)
+        control_frame.pack(side='top', fill='x', pady=10)
+        
+        # 버튼들 중앙 정렬을 위한 내부 프레임
+        btn_box = ttk.Frame(control_frame)
+        btn_box.pack(anchor='center')
+
+        self.btn_start = ttk.Button(btn_box, text="▶ 녹화 시작", command=self.start_recording)
         self.btn_start.pack(side="left", padx=10)
-        self.btn_question = ttk.Button(control_frame, text="⚡️ 돌발 질문", command=self.trigger_question_event, state="disabled")
+        
+        self.btn_panic = tk.Button(btn_box, text="😰 긴장 모드: OFF", font=("Arial", 10), bg="#dddddd", command=self.toggle_anxiety)
+        self.btn_panic.pack(side="left", padx=10)
+        
+        self.btn_question = ttk.Button(btn_box, text="⚡️ 돌발 질문", command=self.trigger_question_event, state="disabled")
         self.btn_question.pack(side="left", padx=10)
-        self.btn_stop = ttk.Button(control_frame, text="■ 결과 보기", command=self.stop_recording, state="disabled")
+        
+        self.btn_stop = ttk.Button(btn_box, text="■ 결과 보기", command=self.stop_recording, state="disabled")
         self.btn_stop.pack(side="left", padx=10)
-        self.status_label = ttk.Label(main_frame, text="준비 완료", font=("Arial", 14), foreground="gray")
-        self.status_label.pack()
-        ttk.Label(main_frame, text="📄 발표 대본 (분석을 위해 필수 입력):", font=("Arial", 12)).pack(anchor='w')
-        self.script_text = tk.Text(main_frame, height=6, font=("Arial", 11))
-        self.script_text.pack(fill='x', pady=(5, 0))
+        
+        self.status_label = ttk.Label(btn_box, text="준비 완료", font=("Arial", 12), foreground="gray")
+        self.status_label.pack(side="left", padx=20)
+
+        # --- 하단 영역: 대본 (스크롤 가능, 크게) ---
+        bottom_frame = ttk.LabelFrame(main_frame, text="📄 발표 대본 (시선이 내려가면 감점됩니다!)")
+        bottom_frame.pack(side='bottom', fill='both', expand=True, pady=(10, 0))
+        
+        # 대본 텍스트 위젯 + 스크롤바
+        self.script_text = tk.Text(bottom_frame, height=8, font=("Arial", 14), bg="white", fg="black", wrap="word")
+        scrollbar = ttk.Scrollbar(bottom_frame, orient="vertical", command=self.script_text.yview)
+        self.script_text.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side="right", fill="y")
+        self.script_text.pack(side="left", fill="both", expand=True)
+        
         self.start_camera()
+
+    # =========================================================================
+    # [기능 복구] 긴장 모드 토글 (텍스트 하얗게 변해서 안 보이는 기능)
+    # =========================================================================
+    def toggle_anxiety(self):
+        self.is_anxious = not self.is_anxious
+        if self.is_anxious:
+            self.btn_panic.config(text="😰 긴장 모드: ON", bg="#ffcccc", fg="red")
+            self.script_text.config(fg="white", bg="white") # 글씨를 흰색으로 변경 (안 보이게)
+            
+            # [긴장 효과] 청중들이 즉시 산만해짐 (Distracted)
+            self.update_audience_images('distracted', 'distracted')
+            
+            threading.Thread(target=self.anxiety_sound_loop, daemon=True).start()
+        else:
+            self.btn_panic.config(text="😰 긴장 모드: OFF", bg="#dddddd", fg="black")
+            self.script_text.config(fg="black", bg="white") # 글씨 복구
+            
+            # [복구] 다시 평범한 상태로
+            self.update_audience_images('default', 'default')
+    # =========================================================================
+    # 리얼 심장 사운드 생성기
+    # =========================================================================
+    
+    def anxiety_sound_loop(self):
+        RATE = 16000
+        BPM = 115 
+        DURATION = 60 / BPM 
+        t = np.linspace(0, DURATION, int(RATE * DURATION), False)
+        
+        s1_freq = 40
+        s1_envelope = np.exp(-t * 25)
+        s1 = (np.sin(2 * np.pi * s1_freq * t) + 0.6 * np.sin(2 * np.pi * 25 * t)) * s1_envelope
+        
+        s2_delay = 0.2
+        t_s2 = t - s2_delay
+        s2_freq = 60
+        s2_envelope = np.exp(-t_s2 * 35) * (t_s2 > 0) 
+        s2 = np.sin(2 * np.pi * s2_freq * t_s2) * s2_envelope * 0.8 
+
+        heartbeat = s1 + s2 # Heartbeat sound
+        tinnitus = np.sin(2 * np.pi * 8500 * t) * 0.04 # 고주파음
+        noise = np.random.uniform(-0.015, 0.015, len(t)) # 백색 소음
+        
+        audio_signal = heartbeat * 1.2 + tinnitus + noise
+        audio_signal = np.clip(audio_signal, -1, 1) * 32767
+        audio_bytes = audio_signal.astype(np.int16).tobytes()
+        
+        try:
+            p = pyaudio.PyAudio()
+            stream = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, output=True)
+            while self.is_anxious:
+                stream.write(audio_bytes)
+                time.sleep(random.uniform(0.0, 0.03))
+            stream.stop_stream(); stream.close(); p.terminate()
+        except Exception as e:
+            print(f"사운드 재생 오류: {e}")
 
     def start_camera(self):
         global cap
         try:
-            cap = cv2.VideoCapture(0)
+            # 1단계: exe 환경에서 가장 안정적인 DSHOW 모드 시도
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            
+            # 2단계: DSHOW가 실패했거나 카메라가 안 열리면 일반 모드로 재시도
+            if cap is None or not cap.isOpened():
+                print("⚠️ DSHOW 모드 실패, 일반 모드로 재시도합니다.")
+                if cap: cap.release()
+                cap = cv2.VideoCapture(0) # 일반 모드
+            
+            # 3단계: 그래도 안 되면 -1번 장치 시도 (일부 노트북용)
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(-1)
+
+            # 최종 확인
             if not cap.isOpened():
-                messagebox.showerror("카메라 오류", "카메라를 열 수 없습니다. 다른 프로그램이 사용 중인지 확인하세요.")
-                self.show_setup_page()
+                messagebox.showerror("카메라 오류", "카메라를 연결할 수 없습니다.\n다른 프로그램이 카메라를 쓰고 있는지 확인해주세요.")
                 return
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            # 해상도 설정 (640x360)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            
+            # 화면 업데이트 시작
             self.update_video_stream()
+            
         except Exception as e:
-            messagebox.showerror("카메라 오류", f"카메라 초기화 중 알 수 없는 오류 발생: {e}")
-            self.show_setup_page()
+            # 어떤 오류인지 정확히 메시지로 띄워줍니다.
+            messagebox.showerror("카메라 오류", f"초기화 실패 원인:\n{e}")
 
-
+    # =========================================================================
+    # [핵심 수정] 정교한 시선 추적 (Iris Tracking & Head Pitch)
+    # =========================================================================
     def update_video_stream(self):
-        global gaze_data, cap
+        global gaze_data, cap, frame_count, face_mesh 
         if not self.winfo_exists(): return
         
         try:
-            # [수정] cap이 None이거나 닫혔으면 루프 중단
-            if cap is None or not cap.isOpened():
-                print("비디오 스트림 중단됨 (캡처 릴리즈됨).")
-                return 
+            if cap is None or not cap.isOpened(): return 
 
             ret, frame = cap.read()
-            if ret:
-                if is_recording:
-                    if out: out.write(frame) # out 객체가 존재할 때만 write
-                    gaze_data['total_frames'] += 1
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                    looking = False
-                    for (x, y, w, h) in faces:
-                        if 640 * 0.3 < (x + w // 2) < 640 * 0.7: looking = True
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0) if looking else (0, 0, 255), 2)
-                    if looking: gaze_data['looking_frames'] += 1
-                
-                frame = cv2.flip(frame, 1)
-                if is_recording: cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
-                
-                # [수정] 640x360 (16:9 비율)로 리사이즈
-                img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((640, 360))) 
-                self.video_panel.configure(image=img); self.video_panel.image = img
+            if not ret: return
             
-            # 루프 지속
+            frame = cv2.flip(frame, 1)
+            frame_count += 1
+            h, w, _ = frame.shape
+
+            # --- 긴장 시각 효과(스크린 펌프 효과) ---       
+            if self.is_anxious:
+                try:
+                    self.heart_phase += 0.35
+                    pulse = (np.sin(self.heart_phase) + 1) / 2 
+                    
+                    overlay = frame.copy()
+                    h, w, channels = frame.shape
+                    if channels == 4: overlay[:] = (0, 0, 255, 255)   
+                    else: overlay[:] = (0, 0, 255)      
+                    
+                    alpha = pulse * 0.25 
+                    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+                    
+                    dx = random.randint(-5, 5)
+                    dy = random.randint(-5, 5)
+                    M = np.float32([[1, 0, dx], [0, 1, dy]])
+                    frame = cv2.warpAffine(frame, M, (w, h))
+                except: pass 
+
+            # --- MediaPipe 얼굴/시선 분석 ---
+            script_gaze_detected = False
+            
+            # 성능을 위해 2프레임마다 분석하지만, 녹화 중에는 매 프레임 체크가 더 정확할 수 있음
+            # 여기서는 2프레임 간격 유지
+            if frame_count % 2 == 0: 
+                try:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = face_mesh.process(rgb_frame)
+                    
+                    if results.multi_face_landmarks:
+                        landmarks = results.multi_face_landmarks[0].landmark
+                        
+                        # 3D 좌표 변환
+                        mesh_points = np.array([np.multiply([p.x, p.y], [w, h]).astype(int) for p in landmarks])
+                        
+                        # [알고리즘 복구] 눈동자 수직 위치 비율 (Vertical Gaze Ratio)
+                        # 왼쪽 눈: 159(위), 145(아래), 468(눈동자)
+                        # 오른쪽 눈: 386(위), 374(아래), 473(눈동자)
+                        
+                        def get_gaze_ratio(top, bottom, iris):
+                            eye_height = np.linalg.norm(top - bottom)
+                            dist_to_top = np.linalg.norm(top - iris)
+                            # 눈을 감았거나 인식이 불안정하면 0.5(정면) 반환
+                            if eye_height < 3: return 0.5 
+                            return dist_to_top / eye_height
+
+                        left_ratio = get_gaze_ratio(mesh_points[159], mesh_points[145], mesh_points[468])
+                        right_ratio = get_gaze_ratio(mesh_points[386], mesh_points[374], mesh_points[473])
+                        avg_ratio = (left_ratio + right_ratio) / 2
+                        
+                        # [핵심 수정] 임계값 재조정 (0.68)
+                        # 0.50: 정면
+                        # 0.57: 너무 예민함 (가만히 있어도 걸림)
+                        # 0.75: 너무 둔감함 (대본 봐도 안 걸림)
+                        # --> 0.68로 설정하여 안정성 확보
+                        if avg_ratio > 0.57: 
+
+                            script_gaze_detected = True
+                            # 시각적 피드백
+                            cv2.putText(frame, "LOOKING DOWN!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                            cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 0, 255), -1)
+                            cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 0, 255), -1)
+                        else:
+                            # 정면 응시
+                            cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 255, 0), -1)
+                            cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 255, 0), -1)
+                        
+                        # 눈 윤곽선
+                        cv2.polylines(frame, [mesh_points[[33, 133]]], True, (200, 200, 200), 1)
+                        cv2.polylines(frame, [mesh_points[[362, 263]]], True, (200, 200, 200), 1)
+
+
+                    # 데이터 집계
+                    if is_recording:
+                        gaze_data['total_frames'] += 1
+                        if script_gaze_detected:
+                            gaze_data['script_frames'] += 1 # 감점 요인
+                        elif results.multi_face_landmarks:
+                            gaze_data['looking_frames'] += 1 # 득점 요인 (정면 응시)
+                            
+                except Exception as e: 
+                    # print(f"Medipipe 오류: {e}") 
+                    pass
+
+            if is_recording and out: 
+                out.write(frame)
+                cv2.circle(frame, (30, 30), 10, (0, 0, 255), -1)
+
+            # 화면 표시를 위해 크기 조정 (640x360)
+            img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((640, 360))) 
+            self.video_panel.configure(image=img); self.video_panel.image = img
+            
             if self.winfo_exists():
                 self.after(30, self.update_video_stream)
                 
         except Exception as e:
-            # 비디오 패널이 파괴된 후에도 self.after가 실행되는 것을 방지
             if self.winfo_exists():
-                print(f"비디오 스트림 업데이트 오류: {e}")
-                self.after(1000, self.update_video_stream) # 오류 시 1초 후 재시도
+                self.after(1000, self.update_video_stream)
 
+    # =========================================================================
+    # [수정됨] 청중 이미지 업데이트 (크기 640x360에 맞춰 조정)
+    # =========================================================================
     def update_audience_images(self, s1, s2):
-        """실제 청중 이미지를 로드합니다."""
-        try:
-          
-            i1 = ImageTk.PhotoImage(Image.open(f"audience1_{s1}.png").resize((200, 150)))
-            self.aud_labels[0].configure(image=i1); self.aud_labels[0].image = i1
-            i2 = ImageTk.PhotoImage(Image.open(f"audience2_{s2}.png").resize((200, 150)))
-            self.aud_labels[1].configure(image=i2); self.aud_labels[1].image = i2
-        except Exception as e:
-            # print(f"청중 이미지 로드 실패: {e}") # 디버깅 시 주석 해제
-            pass # 파일이 없어도 프로그램이 중단되지 않도록 pass
+        def get_image(idx, state):
+            filename = f"audience{idx}_{state}.png" 
+            path = resource_path(filename)
+            if not os.path.exists(path): path = resource_path(f"audience{idx}_default.png")
+            try:
+                # 화면 분할 크기에 맞춰 이미지 리사이징 (약 320x240 정도가 적당)
+                return ImageTk.PhotoImage(Image.open(path).resize((300, 225)))
+            except: return None
 
+        img1 = get_image(1, s1)
+        img2 = get_image(2, s2)
+        
+        if img1: self.aud_labels[0].configure(image=img1); self.aud_labels[0].image = img1
+        if img2: self.aud_labels[1].configure(image=img2); self.aud_labels[1].image = img2
+
+    # =========================================================================
+    # 청중 행동 루프
+    # =========================================================================
+    def audience_loop(self):
+        if not is_recording: return
+        if self.is_anxious:
+            s1, s2 = 'distracted', 'distracted'
+        else:
+            states = ['default']*6 + ['focused']*2 + ['distracted']*1 + ['question']*1
+            s1 = random.choice(states)
+            s2 = random.choice(states)
+        self.update_audience_images(s1, s2)
+        if self.winfo_exists(): self.after(4000, self.audience_loop)
+
+    # =========================================================================
+    # 돌발 질문 트리거
+    # =========================================================================
+    def trigger_question_event(self):
+        if not self.winfo_exists(): return
+        
+        # 질문자 선정 (한 명은 질문, 한 명은 쳐다봄)
+        asker_idx = random.randint(0, 1)
+        if asker_idx == 0: self.update_audience_images('question', 'focused')
+        else: self.update_audience_images('focused', 'question')
+        
+        self.update()
+        threading.Thread(target=self._trigger_question_thread, args=(self.script_text.get("1.0", tk.END).strip(), self.user_settings.get('atmosphere', '정보')), daemon=True).start()
+
+    def _trigger_question_thread(self, script, mode):
+        ai_question = None
+        possible_questions = []
+        if 'app_config' in globals() and hasattr(app_config, 'BACKUP_QUESTIONS'):
+            possible_questions.extend(app_config.BACKUP_QUESTIONS)
+        else:
+            possible_questions.append("가장 중요하다고 생각하는 점은 무엇인가요?")
+
+        if self.AI_AVAILABLE:
+            try:
+                if '정보' in mode: ai_question = self.imrad_validator.generate_imrad_question(script)
+                elif '설득' in mode: ai_question = self.dynamic_generator.generate_question(script, 'B')
+                elif '공감' in mode: ai_question = self.dynamic_generator.generate_question(script, 'C')
+                if ai_question: possible_questions.append(ai_question)
+            except: pass
+
+        final_question = random.choice(possible_questions)
+        if self.winfo_exists(): self.after(0, self._show_question_popup, final_question)
+
+    def _show_question_popup(self, final_question):
+        if not self.winfo_exists(): return
+        self.add_marker(time.time() - start_time, '❓')
+        messagebox.showinfo("💡 돌발 질문", final_question)
+    
     def start_recording(self):
-        global is_recording, start_time, out, speech_data, timeline_markers, gaze_data, audio_data, microphone
+        global is_recording, start_time, out, speech_data, timeline_markers, gaze_data, audio_data
         if len(self.script_text.get("1.0", tk.END).strip()) < 10:
-            messagebox.showwarning("경고", "정확한 분석을 위해 대본을 10자 이상 입력해주세요.")
+            messagebox.showwarning("경고", "대본을 10자 이상 입력해주세요.")
             return
         
-        try:
-            # [수정] 전역 microphone 객체 사용
-            with microphone as source:
-                print("마이크 장치 확인 완료.")
-        except Exception as e:
-            messagebox.showerror("오디오 오류", f"마이크를 찾을 수 없습니다. 마이크가 연결되어 있는지 확인하세요.\n{e}")
-            return
+        if not vosk_model:
+            if not messagebox.askyesno("경고", "음성 인식 모델(Vosk)이 없습니다. 소리 없이 녹화만 하시겠습니까?"):
+                return
 
         is_recording = True; start_time = time.time()
         speech_data = {"full_transcript": "", "word_count": 0, "filler_count": 0}
-        gaze_data = {"total_frames": 0, "looking_frames": 0}
+        # 데이터 초기화 (script_frames 포함)
+        gaze_data = {"total_frames": 0, "looking_frames": 0, "script_frames": 0}
         audio_data = {"volumes": [], "tremble_count": 0}
         timeline_markers = []
-        self.raw_audio_frames = [] # 오디오 스트림 통합 저장을 위해 초기화
+        self.raw_audio_frames = [] 
         
         try:
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            out = cv2.VideoWriter('output.avi', fourcc, 20.0, (640, 480))
+            out = cv2.VideoWriter('output.avi', fourcc, 20.0, (640, 360)) # 해상도 맞춤
         except Exception as e:
-            messagebox.showerror("비디오 쓰기 오류", f"비디오 파일(output.avi)을 생성할 수 없습니다.\n{e}")
+            messagebox.showerror("오류", f"비디오 파일 생성 실패: {e}")
             is_recording = False
             return
             
-        # 오디오/STT 통합 스레드 시작
         threading.Thread(target=self.speech_recognition_thread, daemon=True).start()
         
         self.btn_start['state'] = 'disabled'; self.btn_stop['state'] = 'normal'; self.btn_question['state'] = 'normal'
-        self.script_text['state'] = 'disabled'
-        self.status_label.config(text="🔴 녹화 및 분석 중...", foreground="red")
-        self.audience_loop() # [수정] 청중 반응 루프 시작
+        self.script_text['state'] = 'normal' # 녹화 중에도 스크롤 해야 하므로 normal
+        self.status_label.config(text="🔴 녹화 중", foreground="red")
+        self.audience_loop()
 
+    # [수정됨] Vosk 기반 실시간 SPM(음절) 측정 스레드
     def speech_recognition_thread(self):
-        """[스레드] 오디오 스트림 통합 관리 (STT, WAV 저장, RMS 분석)"""
-        global speech_data, audio_data, recognizer, microphone
-        last_vol = 0
+        global speech_data, audio_data, pa, vosk_model
         
-        with microphone as source:
-            # [수정] 자동 임계값 설정 (마이크 민감도 향상)
-            print("주변 소음 감지 중... (1초)")
-            recognizer.adjust_for_ambient_noise(source, duration=1)
-            print(f"마이크 임계값 자동 설정 완료: {recognizer.energy_threshold}")
-            
-            last_speech_end = time.time()
-            
-            while is_recording:
-                try:
-                    audio = recognizer.listen(source, timeout=2, phrase_time_limit=5)
-                    
-                    # 1. WAV 녹음용 데이터 저장
-                    raw_data = audio.get_raw_data(convert_rate=microphone.SAMPLE_RATE, convert_width=microphone.SAMPLE_WIDTH)
-                    self.raw_audio_frames.append(raw_data) # 'self' 사용
+        SENSITIVITY = 5.0  
+        RATE = 16000
+        CHUNK = 4096
+        
+        if not vosk_model: return
 
-                    # 2. 에너지/떨림 분석용 RMS 계산
-                    rms = audioop.rms(raw_data, microphone.SAMPLE_WIDTH) 
-                    if abs(rms - last_vol) > 2000 and rms > 500: 
-                        audio_data['tremble_count'] += 1
-                    last_vol = rms
-                    audio_data['volumes'].append(rms)
+        rec = KaldiRecognizer(vosk_model, RATE)
+        
+        try:
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        except Exception as e:
+            print(f"마이크 오류: {e}")
+            return
 
-                    # 3. STT용 텍스트 변환
-                    text = recognizer.recognize_google(audio, language='ko-KR')
-                    
-                    # --- STT 성공 후 데이터 처리 ---
-                    timestamp = time.time() - start_time - 1.5
-                    words = text.split() # 'words' 정의
-                    speech_data['word_count'] += len(words)
-                    speech_data['full_transcript'] += text + " "
-                    segment_duration = time.time() - last_speech_end
-                    last_speech_end = time.time()
-                    
-                    if segment_duration > 0.5:
-                        instant_wpm = (len(words) / segment_duration) * 60
-                        if instant_wpm > 220: self.add_marker(timestamp, '⚡️') # 'self' 사용
-                        elif instant_wpm < 60 and len(words) > 2: self.add_marker(timestamp, '🐢') # 'self' 사용
-                        
-                    chunk_filler = 0
-                    if 'app_config' in globals() and hasattr(app_config, 'FILLER_WORDS'):
-                        for word in words: # 'word' 정의 및 사용
-                            if any(f in word for f in app_config.FILLER_WORDS):
-                                chunk_filler += 1; speech_data['filler_count'] += 1
-                    if chunk_filler > 0: self.add_marker(timestamp, '💬') # 'self' 사용
-                    
-                except sr.WaitTimeoutError: # 침묵
-                    if time.time() - last_speech_end > 5.0:
-                        self.add_marker(time.time() - start_time - 5.0, '🤐') # 'self' 사용
-                        last_speech_end = time.time()
+        last_speech_end = time.time()
+        last_vol = 0
+
+        print(f"🎤 마이크 민감도 {SENSITIVITY}배 / SPM 모드로 시작")
+
+        while is_recording:
+            try:
+                if stream.get_read_available() < CHUNK:
+                    time.sleep(0.01)
                     continue
-                except sr.UnknownValueError: # STT 인식 실패
-                    print("STT: 음성을 인식할 수 없습니다.")
-                    pass 
-                except Exception as e:
-                    print(f"STT 스레드 오류: {e}")
-                    time.sleep(0.5) 
+                
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                
+                # --- [민감도 조절] ---
+                audio_array = np.frombuffer(data, dtype=np.int16)
+                audio_array = audio_array * SENSITIVITY
+                audio_array = np.clip(audio_array, -32768, 32767)
+                data = audio_array.astype(np.int16).tobytes()
+                # ---------------------
+
+                self.raw_audio_frames.append(data)
+
+                # 볼륨/떨림 분석
+                rms = audioop.rms(data, 2)
+                if abs(rms - last_vol) > 2000 and rms > 500: 
+                    audio_data['tremble_count'] += 1
+                last_vol = rms
+                audio_data['volumes'].append(rms)
+
+                #vosk 음성 인식
+                if rec.AcceptWaveform(data):
+                    result = json.loads(rec.Result())
+                    text = result.get('text', '')
+                    
+                    if text:
+                        print(f"🎤 인식됨: {text}") # 디버깅용
+                        timestamp = time.time() - start_time
+                        
+                        # SPM(Syllables Per Minute) 로직
+                         # 공백 제거 후 순수 글자 수(음절)만 셉니다.
+                        syllable_count = len(text.replace(" ", "")) 
+                        speech_data['full_transcript'] += text + " "
+
+                        # 변수 이름은 word_count지만, 실제로는 이제 '음절 수'가 저장됩니다.
+                        speech_data['word_count'] += syllable_count 
+                        
+                        # 순간 속도(Instant SPM) 계산
+                        segment_duration = time.time() - last_speech_end
+                        if segment_duration > 0.5:
+                            # (글자수 / 시간초) * 60 = 분당 글자수
+                            instant_spm = (syllable_count / segment_duration) * 60
+                            
+                             # ⚡ SPM 기준 마커 찍기 (한국어 기준)
+                            # 450타 이상 = 말이 너무 빠름
+                            if instant_spm > 450: self.add_marker(timestamp, '⚡️') 
+                            # 200타 이하이고 글자가 좀 길면 = 말이 너무 느림
+                            elif instant_spm < 200 and syllable_count > 5: self.add_marker(timestamp, '🐢') 
+                            
+                        last_speech_end = time.time()
+
+                        if 'app_config' in globals() and hasattr(app_config, 'FILLER_WORDS'):
+                             words = text.split() 
+                             chunk_filler = sum(1 for w in words if w in app_config.FILLER_WORDS)
+                             speech_data['filler_count'] += chunk_filler
+                             if chunk_filler > 0: self.add_marker(timestamp, '💬')
+
+            except Exception as e:
+                print(f"오디오 스레드 오류: {e}")
+                continue
+
+        stream.stop_stream()
+        stream.close()
+        
+        # 마지막 버퍼 처리 (FinalResult)
+        final_res = json.loads(rec.FinalResult())
+        final_text = final_res.get('text', '')
+        if final_text:
+            speech_data['full_transcript'] += final_text + " "
+            # 여기도 음절 수로 저장
+            speech_data['word_count'] += len(final_text.replace(" ", ""))
 
     def add_marker(self, t, emoji):
         if not timeline_markers or (t - timeline_markers[-1]['time'] > 1.5) or timeline_markers[-1]['label'] != emoji:
             timeline_markers.append({'time': max(0.1, t), 'label': emoji})
 
-    def audience_loop(self):
-        """4초마다 청중 표정을 랜덤하게 변경합니다."""
-        if not is_recording: return
-        
-        # 10% 확률로 딴짓, 20% 확률로 집중, 70% 확률로 기본
-        s1 = random.choice(['default']*7 + ['focused']*2 + ['distracted'])
-        s2 = random.choice(['default']*7 + ['focused']*2 + ['distracted'])
-        self.update_audience_images(s1, s2)
-        
-        if self.winfo_exists(): self.after(4000, self.audience_loop) # 4초마다 반복
-
-    # =========================================================================
-    # === [수정] "응답 없음" 방지를 위해 돌발 질문 로직을 스레드로 분리 ===
-    # =========================================================================
-    def trigger_question_event(self):
-        """AI 호출을 별도 스레드로 분리하여 GUI 멈춤(응답 없음) 방지"""
-        if not self.winfo_exists(): return
-        
-        # 1. (메인 스레드) GUI 즉시 변경
-        asker_idx = random.randint(0, 1)
-        if asker_idx == 0: self.update_audience_images('question', 'focused')
-        else: self.update_audience_images('focused', 'question')
-        self.update() # UI 즉시 새로고침
-
-        # 2. (메인 스레드) AI 스레드에 필요한 데이터를 미리 수집
-        try:
-            script = self.script_text.get("1.0", tk.END).strip()
-            mode = self.user_settings.get('atmosphere', '정보')
-        except Exception as e:
-            print(f"대본 읽기 오류: {e}")
-            return
-
-        # 3. (메인 스레드) AI 및 규칙 분석을 별도 스레드에서 실행
-        threading.Thread(target=self._trigger_question_thread, 
-                         args=(script, mode), 
-                         daemon=True).start()
-
-    def _trigger_question_thread(self, script, mode):
-        """(작업 스레드) AI 또는 규칙 기반으로 질문을 생성 (시간 소요)"""
-        
-        ai_question = None
-        possible_questions = []
-        
-        # 1. (필수) 백업 질문 리스트 확보
-        if 'app_config' in globals() and hasattr(app_config, 'BACKUP_QUESTIONS'):
-            possible_questions.extend(app_config.BACKUP_QUESTIONS)
-        else:
-            possible_questions.append("발표 내용 중에 가장 중요하다고 생각하는 점은 무엇인가요?")
-
-        # 2. (선택) AI/규칙 기반 질문 생성 (느린 작업)
-        if self.AI_AVAILABLE:
-            try:
-                if '정보' in mode:
-                    ai_question = self.imrad_validator.generate_imrad_question(script)
-                elif '설득' in mode:
-                    ai_question = self.dynamic_generator.generate_question(script, 'B')
-                elif '공감' in mode:
-                    ai_question = self.dynamic_generator.generate_question(script, 'C')
-                
-                if ai_question:
-                    possible_questions.append(ai_question)
-                else:
-                    print("AI/규칙 기반 질문 생성기가 None을 반환했습니다.")
-                    
-            except Exception as e:
-                print(f"AI 질문 생성 중 오류 발생 (백업 질문만 사용): {e}")
-
-        # 3. 최종 질문 선택
-        final_question = random.choice(possible_questions)
-        
-        # 4. (작업 스레드) GUI 업데이트(팝업)를 다시 메인 스레드에 요청
-        if self.winfo_exists():
-            self.after(0, self._show_question_popup, final_question)
-
-    def _show_question_popup(self, final_question):
-        """(메인 스레드) 작업 스레드가 요청한 팝업창을 안전하게 표시"""
-        if not self.winfo_exists(): return
-        
-        self.add_marker(time.time() - start_time, '❓')
-        messagebox.showinfo("💡 돌발 질문", final_question)
-    # =========================================================================
-
-    # =========================================================================
-    # === [수정] "응답 없음" 방지를 위해 녹화 중단 로직을 스레드로 분리 ===
-    # =========================================================================
     def stop_recording(self):
-        """GUI 멈춤(응답 없음) 방지를 위해 AI 분석을 스레드로 분리"""
         global is_recording
-        
-        # 1. (메인 스레드) 즉시 녹화 중지
         is_recording = False
-        
-        # 2. (메인 스레드) GUI 즉시 업데이트
         self.original_script = self.script_text.get("1.0", tk.END).strip()
         self.btn_stop['state'] = 'disabled'
         self.btn_question['state'] = 'disabled'
-        self.status_label.config(text="⏳ 녹화 종료! 결과 분석 중입니다...", foreground="blue")
+        self.status_label.config(text="⏳ 저장 및 분석 중 (Whisper 구동)...", foreground="blue")
         self.update()
-        
-        # 3. (메인 스레드) 느린 작업(파일 저장, AI 분석)을 별도 스레드로 실행
         threading.Thread(target=self._finalize_and_analyze_thread, daemon=True).start()
 
     def _finalize_and_analyze_thread(self):
-        """(작업 스레드) 키워드 추출(AI) 및 파일 저장을 수행 (시간 소요)"""
-        global cap, out, microphone
+        global cap, out, speech_data 
         
-        # 1. (느린 작업) AI 키워드 추출
-        print("대본 분석 및 키워드 추출 중...")
         try:
             self.extracted_keywords = self.analysis_manager.extract_keywords_from_script(
                 self.original_script, self.AI_AVAILABLE, self.text_model 
             )
-        except Exception as e:
-            print(f"키워드 추출 중 오류 발생: {e}")
-            self.extracted_keywords = [] # 오류 시 빈 리스트로 초기화
+        except: self.extracted_keywords = []
         
-        # 2. (느린 작업) 오디오 파일 저장
         try:
             if self.raw_audio_frames:
-                print(f"WAV 파일 저장 시도... (총 {len(self.raw_audio_frames)}개 청크)")
                 wf = wave.open("output.wav", 'wb')
-                
-                #  'microphone' 객체 대신 'pyaudio' 기본값 사용
-                wf.setnchannels(1) #  1채널(모노)로 고정
-                wf.setsampwidth(microphone.SAMPLE_WIDTH)
-                wf.setframerate(microphone.SAMPLE_RATE)
-                
+                wf.setnchannels(1) 
+                wf.setsampwidth(2) 
+                wf.setframerate(16000) 
                 wf.writeframes(b''.join(self.raw_audio_frames))
                 wf.close()
-                print("output.wav 저장 완료.")
+                print("✅ output.wav 저장 완료.")
             else:
-                print("저장할 오디오 데이터가 없습니다.")
+                print("❌ 저장할 오디오 데이터 없음")
+                return 
         except Exception as e:
-            print(f"output.wav 저장 실패: {e}")
-     
-        # 3. (느린 작업) 비디오 파일 및 카메라 릴리즈 
-        time.sleep(1.0) # 비디오 쓰기 완료 대기
-        if out: 
-            out.release()
-            out = None
-            print("비디오 라이터 릴리즈 완료.")
-        if cap: 
-            cap.release()
-            cap = None
-            print("카메라 캡처 릴리즈 완료.")
+            print(f"wav 저장 실패: {e}")
+
+        # Whisper 하이브리드 로직
+        # Vosk가 대충 받아적은걸 Whisper가 '정밀 청취'하여 덮어씁니다.
+        try:
+            print("⏳ Whisper 정밀 분석 시작 (잠시만 기다리세요)...")
+
+            # 모델 로드 (tiny, base, small 중 선택. small이 한국어 성능/속도 밸런스 굿)
+            # device="cpu", compute_type="int8" -> CPU에서 빠르게 돌리기 위한 설정
+            model = WhisperModel("small", device="cpu", compute_type="int8")
+
+            # 변환 실행 (beam_size=5는 정확도를 높임)
+            segments, info = model.transcribe("output.wav", beam_size=5, language="ko")
             
-        # 4. (작업 스레드) 모든 작업 완료 후, 메인 스레드에 결과 페이지 표시 요청
+            whisper_text = ""
+            for segment in segments:
+                whisper_text += segment.text + " "
+            
+            print(f"✅ Whisper 변환 결과: {whisper_text}")
+            # [핵심] Vosk가 작성한 엉성한 대본을 Whisper의 완벽한 대본으로 교체!
+            speech_data['full_transcript'] = whisper_text.strip()
+            
+        except Exception as e:
+            print(f"❌ Whisper 분석 실패 (Vosk 결과 유지): {e}")
+     
+        time.sleep(1.0)
+        if out: out.release(); out = None
+        if cap: cap.release(); cap = None
+            
         if self.winfo_exists(): 
             self.after(0, self.show_analysis_page)
-    # =========================================================================
 
+    # =========================================================================
+    # [수정됨] 분석 페이지: 감점 로직 반영
+    # =========================================================================
     def show_analysis_page(self):
         self.clear_window()
         main_canvas = tk.Canvas(self)
@@ -551,48 +793,107 @@ class App(tk.Tk):
         self.bind_all("<MouseWheel>", lambda e: main_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
         content = ttk.Frame(scrollable_frame, padding=30)
         content.pack(fill='both', expand=True)
+
+        global speech_data, gaze_data, audio_data, start_time
         
+        # 실제 오디오 길이 기반 시간 측정
         duration_min = max(0.1, (time.time() - start_time) / 60)
+        try:
+            # output.wav 파일의 헤더를 읽어서 정확한 녹음 시간(초)을 구함
+            with contextlib.closing(wave.open("output.wav", 'r')) as f:
+                frames = f.getnframes()
+                rate = f.getframerate()
+                duration_sec = frames / float(rate)
+                duration_min = max(0.01, duration_sec / 60)
+                print(f"⏱️ 실제 녹음 시간: {duration_sec:.2f}초") # 디버깅용
+        except Exception as e:
+            print(f"시간 계산 오류(백업 로직 사용): {e}")
+            duration_min = max(0.1, (time.time() - start_time) / 60)
+
+        # Whisper 텍스트 가져오기
+        current_transcript = speech_data['full_transcript']
         
-        wpm = int(speech_data['word_count'] / duration_min) if speech_data['word_count'] > 0 else 0 
-        score_speed = max(0, 100 - abs(130 - wpm))
+        # 공백 제외 순수 글자 수 (음절)
+        char_count = len(current_transcript.replace(" ", ""))   
+
+        # 속도 점수
+        spm = int(speech_data['word_count'] / duration_min) if speech_data['word_count'] > 0 else 0 
+        score_speed = max(0, 100 - int(abs(350 - spm) * 0.4))
+        speed_eval = "적정"
+        if spm < 280: speed_eval = "느림 🐢"
+        elif spm > 420: speed_eval = "빠름 ⚡"
+        
+        # 시선 처리 점수 (감점 로직 적용)
         total_frames = max(1, gaze_data['total_frames'])
-        gaze_ratio = int((gaze_data['looking_frames'] / total_frames) * 100)
-        score_gaze = min(100, int(gaze_ratio * 1.43))
-        mode = self.user_settings.get('atmosphere', '정보')
         
-        if len(speech_data['full_transcript'].strip()) > 10:
-            match_rate, match_label_text = self.analysis_manager.calculate_smart_match(
-                self.original_script, speech_data['full_transcript'], mode
-            )
+        # 1. 정면 응시율 (기본 점수)
+        base_gaze_score = (gaze_data['looking_frames'] / total_frames) * 100
+        
+        # 2. 대본 응시(Looking Down) 감점
+        script_penalty = (gaze_data['script_frames'] / total_frames) * 150 # 감점 가중치
+        
+        # 3. 최종 시선 점수
+        final_gaze_score = max(0, min(100, int(base_gaze_score - script_penalty)))
+        
+        # 전달률 점수(Whisper 기반)
+        import difflib
+        script = self.original_script
+        if len(current_transcript.strip()) > 5:
+            def clean_text(text):
+                return re.sub(r'[^가-힣a-zA-Z0-9]', '', text)
+            clean_script = clean_text(script)
+            clean_trans = clean_text(current_transcript)
+            matcher = difflib.SequenceMatcher(None, clean_script, clean_trans)
+            raw_score = matcher.ratio() * 100
+            match_rate = int(raw_score * 1.05) 
+            if match_rate > 100: match_rate = 100
+            match_label_text = "전달률"
         else:
-            match_rate, match_label_text = 0, "데이터 부족"
-            
-        score_match = match_rate
+            match_rate = 0
+            match_label_text = "데이터 부족"
+
+        # 유창성 점수
         filler_deduction = speech_data['filler_count'] * 3
         tremble_score = max(0, 100 - int(audio_data['tremble_count'] / duration_min * 2))
         score_fluency = int((max(0, 100 - filler_deduction) + tremble_score) / 2)
         
-        if '정보' in mode: total_score = int(score_match * 0.4 + score_fluency * 0.3 + score_gaze * 0.2 + score_speed * 0.1)
-        elif '설득' in mode: total_score = int(score_gaze * 0.4 + score_speed * 0.2 + score_fluency * 0.2 + score_match * 0.2)
-        else: total_score = int(score_match * 0.3 + score_gaze * 0.3 + score_fluency * 0.2 + score_speed * 0.2)
+        # 종합 점수
+        mode = self.user_settings.get('atmosphere', '정보')
+        if '정보' in mode: total_score = int(match_rate * 0.4 + score_fluency * 0.3 + final_gaze_score * 0.2 + score_speed * 0.1)
+        elif '설득' in mode: total_score = int(final_gaze_score * 0.4 + score_speed * 0.2 + score_fluency * 0.2 + match_rate * 0.2)
+        else: total_score = int(match_rate * 0.3 + final_gaze_score * 0.3 + score_fluency * 0.2 + score_speed * 0.2)
         self.save_history(total_score)
         
+        # UI 표시
         tk.Label(content, text=f"🏆 종합 점수: {total_score}점", font=("Arial", 36, "bold"), fg="#007aff").pack(pady=20)
-        summary = ttk.Frame(content); summary.pack(pady=10, fill='x')
+        
+        if gaze_data['script_frames'] > total_frames * 0.2:
+            tk.Label(content, text=f"⚠️ 대본을 너무 자주 보셨습니다! (감점 -{int(script_penalty)}점)", font=("Arial", 12), fg="red").pack()
+
+        summary = ttk.Frame(content)
+        summary.pack(pady=10, fill='x')
         for i in range(4): summary.columnconfigure(i, weight=1)
-        self.create_stat_card(summary, 0, "🗣️ 속도", f"{wpm} WPM", score_speed)
-        self.create_stat_card(summary, 1, f"📝 {match_label_text}", f"{match_rate}%", score_match)
-        self.create_stat_card(summary, 2, "👀 시선 처리", f"{gaze_ratio}%", score_gaze)
+        self.create_stat_card(summary, 0, f"🗣️ 속도 ({speed_eval})", f"{spm} SPM", score_speed)
+        self.create_stat_card(summary, 1, f"📝 {match_label_text}", f"{match_rate}%", match_rate)
+        self.create_stat_card(summary, 2, "👀 시선 처리", f"{final_gaze_score}점", final_gaze_score)
         self.create_stat_card(summary, 3, "🌊 유창성", f"{score_fluency}점", score_fluency)
         
-        self.create_video_player(content)
-        self.create_score_graph(content)
-        self.create_feedback_section(content, mode, match_rate, gaze_ratio, score_fluency, wpm, speech_data['full_transcript'], audio_data['volumes'])
+        try:
+            self.create_video_player(content)
+        except Exception as e:
+            tk.Label(content, text=f"비디오 플레이어 오류: {e}", fg="red").pack()
+
+            # 그래프 그리기 (가장 에러 많이 나는 곳 - 안전장치 추가)
+        try:
+            self.create_score_graph(content)
+        except Exception as e:
+                tk.Label(content, text=f"그래프 생성 실패: {e}", fg="red").pack()
+        self.create_feedback_section(content, mode, match_rate, final_gaze_score, score_fluency, spm, speech_data['full_transcript'], audio_data['volumes'])
         
         ttk.Button(content, text="처음으로 돌아가기", command=self.show_setup_page).pack(pady=30)
         self.load_video()
 
+        
     def create_stat_card(self, parent, col, title, value, score):
         frame = tk.Frame(parent, bg="white", bd=1, relief="solid")
         frame.grid(row=0, column=col, padx=10, sticky="nsew")
@@ -613,33 +914,38 @@ class App(tk.Tk):
         ttk.Button(btn_frame, text="■ 정지", command=self.stop_video).pack(side='left', padx=5)
 
     def create_score_graph(self, parent):
-        """[수정됨] X축 눈금 오류를 수정한 그래프 생성"""
-        graph_frame = ttk.Frame(parent); graph_frame.pack(fill='x', pady=20, padx=20)
+        graph_frame = ttk.Frame(parent)
+        graph_frame.pack(fill='x', pady=20, padx=20)
+
         fig, ax = plt.subplots(figsize=(8, 2.5))
-        
         history_len = len(self.history)
-        
+
         if history_len > 0:
+            # X축 데이터 생성 (1, 2, 3...)
             x_ticks = range(1, history_len + 1)
+            
+            # 그래프 그리기
             ax.plot(x_ticks, self.history, marker='o', linestyle='-', color='#007aff', linewidth=2)
             ax.fill_between(x_ticks, self.history, color='#007aff', alpha=0.1)
             ax.set_title("연습 점수 트렌드")
             ax.set_ylim(0, 105)
-            
             ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-            ax.set_xlim(0.5, history_len + 0.5)
+ 
             
-            if history_len == 1:
-                ax.set_xticks([1])
-            elif history_len < 10:
-                 ax.set_xticks(x_ticks)
-
+            ax.set_xlim(0.5, history_len + 0.5)
             ax.grid(True, linestyle='--')
             
-        canvas = FigureCanvasTkAgg(fig, master=graph_frame); canvas.draw(); canvas.get_tk_widget().pack(fill='both')
+        else:
+            # 데이터가 없을 때 빈 그래프 처리
+            ax.set_title("아직 연습 기록이 없습니다")
+            ax.set_yticks([])
+            ax.set_xticks([])
 
+        canvas = FigureCanvasTkAgg(fig, master=graph_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both')
 
-    def create_feedback_section(self, parent, mode_raw, match_rate, gaze_ratio, fluency, wpm, transcript, volume_data):
+    def create_feedback_section(self, parent, mode_raw, match_rate, gaze_ratio, fluency, spm, transcript, volume_data):
         fb_frame = tk.LabelFrame(parent, text="🤖 AI 코치 피드백", font=("Arial", 14, "bold"))
         fb_frame.pack(fill='x', pady=20, ipady=10)
         
@@ -648,97 +954,59 @@ class App(tk.Tk):
         else: mapped_mode = '열정적'; target_type_key = 'B'
         
         final_report_text = ""
-
-        if wpm == 0 and len(transcript.strip()) < 10:
-            final_report_text = "🚨 **데이터 부족 경고:**\n음성 데이터가 충분히 인식되지 않았습니다.\n마이크 연결을 확인하고, 녹화 중 더 크게 말씀해주세요."
+        if spm == 0 and len(transcript.strip()) < 10:
+            final_report_text = "🚨 **데이터 부족:** 음성 데이터가 충분히 인식되지 않았습니다."
         else:
             final_report_text += "--- 📈 AI 코칭 리포트 (규칙 기반) ---\n"
-            
             style_feedback = self.analysis_manager.analyze_speech_style(transcript, mapped_mode)
             energy_feedback = self.analysis_manager.analyze_vocal_energy(volume_data, mapped_mode)
-            delivery_metrics = {"wpm": wpm}
+            delivery_metrics = {"spm": spm} 
             
-            final_report_text += f"{style_feedback}\n"
-            final_report_text += f"{energy_feedback}\n\n"
+            final_report_text += f"{style_feedback}\n{energy_feedback}\n\n"
             
             imrad_report = []
-            if target_type_key == 'A':
-                imrad_report = self.imrad_validator.validate_imrad_sections(self.original_script)
-            
-            if imrad_report: 
-                final_report_text += "--- [논리 구조 경고] ---\n" + "\n".join(imrad_report) + "\n\n"
+            if target_type_key == 'A': imrad_report = self.imrad_validator.validate_imrad_sections(self.original_script)
+            if imrad_report: final_report_text += "--- [논리 구조 경고] ---\n" + "\n".join(imrad_report) + "\n\n"
             
             final_report_text += "--- 🤖 AI 심층 피드백 (Gemini) ---\n"
-
             ai_generated_feedback = None 
-            
             if self.AI_AVAILABLE and self.text_model: 
-                print("AI 심층 코칭 리포트 생성을 시도합니다... (gemini-2.5-pro)")
                 try:
                     ai_generated_feedback = self.analysis_manager.generate_ai_feedback(
                         self.text_model, transcript, target_type_key, delivery_metrics, 
                         style_feedback, energy_feedback, imrad_report
                     )
                 except Exception as e:
-                    print(f"AI 심층 피드백 생성 오류: {e}")
-                    ai_generated_feedback = f"AI 심층 피드백 생성 중 오류가 발생했습니다: {e}"
+                    ai_generated_feedback = f"오류: {e}"
             
-            if ai_generated_feedback:
-                final_report_text += ai_generated_feedback
-            else:
-                print("AI 코칭 API를 사용할 수 없거나 실패했습니다. 로컬 규칙 기반 피드백을 생성합니다.")
-                
-                fallback_text = "Gemini AI를 사용할 수 없어 심층 피드백을 생성하지 못했습니다. 대신 로컬 규칙 기반 요약을 제공합니다.\n\n"
-                
-                if fluency < 70: fallback_text += "⚠️ [유창성] 목소리 떨림이나 '음, 어' 같은 필러워드가 감지되었습니다.\n"
-                if wpm > 150: fallback_text += f"⚠️ [속도] 말이 다소 빠릅니다 ({wpm} WPM).\n"
-                elif wpm < 100 and wpm > 0: fallback_text += f"⚠️ [속도] 말이 다소 느립니다 ({wpm} WPM).\n"
-                
-                if len(fallback_text.split('\n')) < 6:
-                    fallback_text += "\n🎉 전반적으로 아주 훌륭한 발표 역량을 보여주셨습니다!"
-                
-                final_report_text += fallback_text
+            if ai_generated_feedback: final_report_text += ai_generated_feedback
+            else: final_report_text += "Gemini API 미연결로 심층 피드백을 건너뜁니다."
         
         tk.Label(fb_frame, text=final_report_text, font=("Arial", 12), justify="left", wraplength=800, padx=20).pack(anchor='w', fill='x')
 
     def load_video(self):
         try:
-            # 비디오 파일 존재 여부 확인
-            if not os.path.exists('output.avi'):
-                print("녹화 파일(output.avi)을 찾을 수 없습니다. 플레이어를 로드하지 않습니다.")
-                self.vid_player_label.config(text="녹화된 비디오 파일을 찾을 수 없습니다.\n(output.avi)", foreground="red")
-                return
-                
+            if not os.path.exists('output.avi'): return
             self.vid_cap = cv2.VideoCapture('output.avi')
-            if not self.vid_cap.isOpened():
-                print("녹화 파일(output.avi)을 열 수 없습니다.")
-                self.vid_player_label.config(text="녹화 파일을 열 수 없습니다.", foreground="red")
-                return
-                
             self.vid_duration = max(1, self.vid_cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_cap.get(cv2.CAP_PROP_FPS))
             self.is_playing = False
             self.draw_timeline()
             self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self.update_frame()
-        except Exception as e:
-            print(f"비디오 로드 오류: {e}")
-            if hasattr(self, 'vid_player_label'):
-                self.vid_player_label.config(text=f"비디오 로드 오류: {e}", foreground="red")
+        except: pass
 
     def draw_timeline(self):
         if not hasattr(self, 'timeline') or not self.timeline.winfo_exists(): return
         self.timeline.delete("all")
-        self.update_idletasks()
         try:
             w = self.timeline.winfo_width()
-            if w < 2: w = 1100 # 너비가 0일 경우 기본값
+            if w < 2: w = 1100 
             self.timeline.create_line(0, 20, w, 20, fill="#ced4da", width=2)
             for m in timeline_markers:
                 if self.vid_duration > 0:
                     x = (m['time'] / self.vid_duration) * w
                     self.timeline.create_text(x, 20, text=m['label'], font=("Arial", 16), tags=(str(m['time']),))
-        except Exception as e:
-            print(f"타임라인 그리기 오류: {e}") 
+        except: pass
 
     def on_timeline_click(self, event):
         if not hasattr(self, 'timeline') or not self.timeline.winfo_exists(): return
@@ -746,213 +1014,111 @@ class App(tk.Tk):
         if tags: self.seek(float(tags[0]))
 
     def on_slider_move(self, val): 
-        if hasattr(self, 'vid_duration'):
-            self.seek((float(val) / 100) * self.vid_duration)
+        if hasattr(self, 'vid_duration'): self.seek((float(val) / 100) * self.vid_duration)
             
     def seek(self, sec):
         if hasattr(self, 'vid_cap') and self.vid_cap and self.vid_cap.isOpened():
             self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * self.vid_cap.get(cv2.CAP_PROP_FPS)))
             self.update_frame()
 
-    # =========================================================================
-    # =========================================================================
-    
     def audio_playback_thread(self):
-        """오디오 재생을 위한 별도 스레드 (pyaudio 사용)"""
         global pa
         CHUNK = 1024
-        
         try:
-            if not os.path.exists("output.wav"):
-                print("output.wav 파일이 없어 소리 없이 재생합니다.")
-                return
-            
+            if not os.path.exists("output.wav"): return
             wf = wave.open("output.wav", 'rb')
-            
-            # 전역 'pa' 인스턴스를 사용하여 스트림 열기
             stream = pa.open(format=pa.get_format_from_width(wf.getsampwidth()),
-                             channels=wf.getnchannels(),
-                             rate=wf.getframerate(),
-                             output=True)
-
+                             channels=wf.getnchannels(), rate=wf.getframerate(), output=True)
             data = wf.readframes(CHUNK)
-
-            # self.is_playing 플래그를 확인하며 데이터 스트리밍
             while data and self.is_playing:
                 stream.write(data)
                 data = wf.readframes(CHUNK)
-
-            stream.stop_stream()
-            stream.close()
-            wf.close()
-            
-        except Exception as e:
-            print(f"오디오 재생 스레드 오류: {e}")
-        
-        # 오디오가 끝나거나 중지되면 is_playing을 False로 설정
+            stream.stop_stream(); stream.close(); wf.close()
+        except Exception as e: print(f"오디오 재생 오류: {e}")
         self.is_playing = False
 
     def play_video_with_sound(self):
-        """[수정] 오디오/비디오 스레드를 '동시에' 시작 (winsound 제거)"""
         if self.is_playing: return
-        if not hasattr(self, 'vid_cap') or not self.vid_cap or not self.vid_cap.isOpened():
-            messagebox.showwarning("재생 오류", "재생할 비디오 파일이 로드되지 않았습니다.")
-            return
-            
         self.is_playing = True
-        
         threading.Thread(target=self.audio_playback_thread, daemon=True).start()
-        
         self.play_video_loop()
 
     def stop_video(self):
-        """[수정] is_playing 플래그만 설정 (winsound 제거)"""
         self.is_playing = False
 
     def play_video_loop(self):
-        if not self.winfo_exists(): 
-            self.is_playing = False # 창이 닫히면 재생 중지
-            return
-        if not hasattr(self, 'vid_cap') or not self.vid_cap or not self.vid_cap.isOpened():
-            self.is_playing = False
-            return
-            
-        if self.is_playing:
+        if not self.winfo_exists() or not self.is_playing: return
+        if self.vid_cap and self.vid_cap.isOpened():
             ret, frame = self.vid_cap.read()
             if ret:
                 self.show_frame(frame)
                 current_pos = self.vid_cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-                
-                if hasattr(self, 'vid_slider'):
-                    self.vid_slider.set((current_pos / self.vid_duration) * 100)
-                self.after(33, self.play_video_loop) # 약 30fps
+                if hasattr(self, 'vid_slider'): self.vid_slider.set((current_pos / self.vid_duration) * 100)
+                self.after(33, self.play_video_loop) 
             else: 
                 self.stop_video()
-                if hasattr(self, 'vid_cap') and self.vid_cap:
-                    self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # 재생 완료 시 처음으로 되감기
-
+                self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def update_frame(self):
-        if hasattr(self, 'vid_cap') and self.vid_cap and self.vid_cap.isOpened():
+        if self.vid_cap and self.vid_cap.isOpened():
             ret, frame = self.vid_cap.read()
             if ret: self.show_frame(frame)
 
     def show_frame(self, frame):
         try:
-            if not hasattr(self, 'vid_player_label') or not self.vid_player_label.winfo_exists():
-                return
-                
+            if not hasattr(self, 'vid_player_label') or not self.vid_player_label.winfo_exists(): return
             w = self.vid_player_label.winfo_width()
             if w > 1:
-                target_h = int(w * (9 / 16)) # 16:9 비율로 높이 계산
-                
-                # 원본 프레임 비율 유지하며 리사이즈
+                target_h = int(w * (9 / 16)) 
                 h, w_orig = frame.shape[:2]
                 scale = target_h / h
                 target_w = int(w_orig * scale)
-                
-                # 리사이즈 (가로/세로 비율 유지)
                 resized_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
                 img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)))
                 self.vid_player_label.configure(image=img, anchor='center'); self.vid_player_label.image = img
             else:
                 img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((640, 360)))
                 self.vid_player_label.configure(image=img, anchor='center'); self.vid_player_label.image = img
-        except Exception as e:
-            # print(f"프레임 표시 오류: {e}") # 디버깅 시 주석 해제
-            pass 
+        except: pass 
 
     def show_rewriter_window(self):
         if not self.AI_AVAILABLE:
-            messagebox.showerror("기능 비활성화", "Gemini API 키가 설정되지 않아 AI 대본 재작성 기능을 사용할 수 없습니다.")
+            messagebox.showerror("오류", "Gemini API 키가 없어 실행할 수 없습니다.")
             return
-
         self.rewriter_win = tk.Toplevel(self)
-        self.rewriter_win.title("📢 AI 대본 재작성 (Gemini)")
+        self.rewriter_win.title("📢 AI 대본 재작성")
         self.rewriter_win.geometry("1000x700")
-
-        main_frame = ttk.Frame(self.rewriter_win, padding=10)
-        main_frame.pack(fill='both', expand=True)
-        
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill='x', pady=5)
-        
-        ttk.Label(control_frame, text="변환할 스타일:").pack(side='left', padx=(0, 5))
+        main_frame = ttk.Frame(self.rewriter_win, padding=10); main_frame.pack(fill='both', expand=True)
+        control_frame = ttk.Frame(main_frame); control_frame.pack(fill='x', pady=5)
+        ttk.Label(control_frame, text="스타일:").pack(side='left', padx=(0, 5))
         self.rewrite_mode = tk.StringVar(value='B')
-        modes = [('정보형 (A)', 'A'), ('설득형 (B)', 'B'), ('공감형 (C)', 'C')]
-        for text, mode in modes:
+        for text, mode in [('정보형 (A)', 'A'), ('설득형 (B)', 'B'), ('공감형 (C)', 'C')]:
             ttk.Radiobutton(control_frame, text=text, variable=self.rewrite_mode, value=mode).pack(side='left', padx=5)
-        
-
-        text_frame = ttk.Frame(main_frame)
-        text_frame.pack(fill='both', expand=True, pady=5)
-        text_frame.columnconfigure(0, weight=1); text_frame.columnconfigure(1, weight=1)
-        text_frame.rowconfigure(0, weight=1)
-
-        left_pane = ttk.Frame(text_frame, padding=5)
-        left_pane.grid(row=0, column=0, sticky='nsew')
-        ttk.Label(left_pane, text="[원본 대본]을 여기에 붙여넣으세요:").pack(anchor='w')
-        self.original_text = tk.Text(left_pane, height=30, width=50, font=("Arial", 11), wrap='word')
-        self.original_text.pack(fill='both', expand=True)
-
-        right_pane = ttk.Frame(text_frame, padding=5)
-        right_pane.grid(row=0, column=1, sticky='nsew')
-        ttk.Label(right_pane, text="[AI 변환 결과]:").pack(anchor='w')
-        self.rewritten_text = tk.Text(right_pane, height=30, width=50, font=("Arial", 11), wrap='word', state='disabled')
-        self.rewritten_text.pack(fill='both', expand=True)
-
-        action_frame = ttk.Frame(main_frame)
-        action_frame.pack(fill='x', pady=10)
-        
-        self.rewrite_status_label = ttk.Label(action_frame, text="준비 완료.", foreground="gray")
-        self.rewrite_status_label.pack(side='left', padx=10)
-          
-        self.rewrite_btn = ttk.Button(action_frame, text="🚀 대본 변환 실행", command=self.run_rewriter)
-        self.rewrite_btn.pack(side='right')
+        text_frame = ttk.Frame(main_frame); text_frame.pack(fill='both', expand=True, pady=5)
+        text_frame.columnconfigure(0, weight=1); text_frame.columnconfigure(1, weight=1); text_frame.rowconfigure(0, weight=1)
+        self.original_text = tk.Text(text_frame, height=30, width=50, font=("Arial", 11)); self.original_text.grid(row=0, column=0)
+        self.rewritten_text = tk.Text(text_frame, height=30, width=50, font=("Arial", 11), state='disabled'); self.rewritten_text.grid(row=0, column=1)
+        action_frame = ttk.Frame(main_frame); action_frame.pack(fill='x', pady=10)
+        self.rewrite_status_label = ttk.Label(action_frame, text="준비 완료", foreground="gray"); self.rewrite_status_label.pack(side='left', padx=10)
+        self.rewrite_btn = ttk.Button(action_frame, text="🚀 변환 실행", command=self.run_rewriter); self.rewrite_btn.pack(side='right')
 
     def run_rewriter(self):
         script = self.original_text.get("1.0", tk.END).strip()
-        if len(script) < 20:
-            messagebox.showwarning("오류", "원본 대본을 20자 이상 입력하세요.", parent=self.rewriter_win)
-            return
-            
-        if not hasattr(self, 'ai_announcer') or not hasattr(self.ai_announcer, 'rewrite'):
-            messagebox.showerror("오류", "AI Rewriter가 제대로 로드되지 않았습니다.", parent=self.rewriter_win)
-            return
-
-        mode = self.rewrite_mode.get()
-        
-        self.rewrite_status_label.config(text="AI가 대본을 재작성 중입니다... (최대 30초 소요)", foreground="blue")
-        self.rewrite_btn.config(state='disabled')
-        self.rewriter_win.update()
-
-        threading.Thread(target=self._rewrite_thread_target, args=(script, mode), daemon=True).start()
+        if len(script) < 20: return
+        self.rewrite_status_label.config(text="AI가 변환 중...", foreground="blue")
+        threading.Thread(target=self._rewrite_thread_target, args=(script, self.rewrite_mode.get()), daemon=True).start()
 
     def _rewrite_thread_target(self, script, mode):
-        """[스레드] 대본 재작성 (API 호출)"""
         try:
-            rewritten_script = self.ai_announcer.rewrite(script, mode)
-            if self.winfo_exists():
-                self.after(0, self.update_rewriter_ui, rewritten_script)
+            res = self.ai_announcer.rewrite(script, mode)
+            if self.winfo_exists(): self.after(0, self.update_rewriter_ui, res)
         except Exception as e:
-            print(f"대본 재작성 스레드 오류: {e}")
-            if self.winfo_exists():
-                self.after(0, self.update_rewriter_ui, f"오류 발생: {e}")
-                
-    def update_rewriter_ui(self, rewritten_script):
+            if self.winfo_exists(): self.after(0, self.update_rewriter_ui, f"오류: {e}")
+
+    def update_rewriter_ui(self, res):
         if hasattr(self, 'rewriter_win') and self.rewriter_win.winfo_exists():
-            self.rewritten_text.config(state='normal')
-            self.rewritten_text.delete("1.0", tk.END)
-            self.rewritten_text.insert("1.0", rewritten_script)
-            self.rewritten_text.config(state='disabled')
-            
-            if "오류" in rewritten_script or "❌" in rewritten_script:
-                self.rewrite_status_label.config(text="대본 재작성 실패.", foreground="red")
-                self.rewrite_btn.config(state='normal')
-            else:
-                self.rewrite_status_label.config(text="변환 완료!", foreground="green")
-                self.rewrite_btn.config(state='normal')
+            self.rewritten_text.config(state='normal'); self.rewritten_text.delete("1.0", tk.END); self.rewritten_text.insert("1.0", res); self.rewritten_text.config(state='disabled')
+            self.rewrite_status_label.config(text="완료" if "오류" not in res else "실패", foreground="green" if "오류" not in res else "red")
 
 if __name__ == "__main__":
     app = App()
