@@ -52,7 +52,6 @@ class AI_Announcer:
         """(MODIFIED) 텍스트 모델만 전달받음 (TTS 기능 삭제)"""
         self.text_model = text_model
 
-
     def rewrite(self, script, type_code):
         """(MODIFIED) 텍스트 모델(gemini-2.5-pro)을 사용하여 대본 재작성"""
         if self.text_model is None:
@@ -60,10 +59,13 @@ class AI_Announcer:
 
         style = FINAL_CONFIG["styles"].get(type_code, FINAL_CONFIG["styles"]["A"])
         
+        # [수정 부분] 백슬래시(\)가 포함된 join 연산을 f-string 밖으로 뺐습니다.
+        core_rules_text = '\n'.join(FINAL_CONFIG['role']['core_rules'])
+        
         system_prompt = f"""
         You are an {FINAL_CONFIG['role']['identity']}.
         Rewrite the user's script following these strict rules:
-        {'\n'.join(FINAL_CONFIG['role']['core_rules'])}
+        {core_rules_text}
 
         ### TARGET STYLE: {style['name']}
         FOCUS: {style['focus']}
@@ -80,4 +82,3 @@ class AI_Announcer:
             return response.text
         except Exception as e:
             return f"❌ 대본 재작성 오류 발생: Gemini API(Text) 호출 실패. {e}"
-
