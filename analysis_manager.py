@@ -8,22 +8,46 @@ class AnalysisManager:
         self.STOPWORDS = stopwords
         self.COACHING_CONFIG = coaching_config
         self.imrad_validator = IMRADValidator() # IMRAD 검증기 인스턴스화
-
     def extract_keywords_from_script(self, script, ai_available, gemini_model):
-        """AI 또는 로컬 방식으로 대본에서 핵심 키워드 5개 추출"""
+        """대본 길이에 맞춰 유동적으로 핵심 키워드 추출 (최소 5개 ~ 최대 15개)"""
+        
+        # [수정] 대본 길이에 따라 추출 개수 자동 조절
+        # 기본 5개 + 글자수 200자마다 1개씩 추가 (최대 15개 제한)
+        target_count = min(15, 5 + int(len(script) / 200))
+
         extracted_keywords = []
+        
+        # 1. AI 모드
         if ai_available and len(script) > 50 and gemini_model:
             try:
-                prompt = (f"다음 발표 대본에서 가장 중요한 '핵심 명사' 5개만 추출해줘. "
+                # 프롬프트에 동적 개수(target_count) 반영
+                prompt = (f"다음 발표 대본에서 가장 중요한 핵심 키워드 {target_count}개를 추출해줘. "
                           f"추상적인 단어보다는 구체적인 소재나 데이터 관련 단어 위주로.\n"
-                          f"결과는 쉼표로 구분해서 단어만 나열해줘 (예: 인공지능, 매출, 데이터, 고객, 설문조사):\n\n{script[:2000]}")
+                          f"결과는 쉼표로 구분해서 단어만 나열해줘:\n\n{script[:3000]}") # 길이 제한 늘림
+                
                 response = gemini_model.generate_content(prompt)
                 if response.text:
                     extracted_keywords = [k.strip() for k in response.text.split(',')]
-                    print(f">>> [AI] 추출 키워드: {extracted_keywords}")
-                    return extracted_keywords
+                    # 혹시 AI가 너무 많이 주면 자르기
+                    return extracted_keywords[:target_count]
             except Exception as e:
-                 print(f"Gemini API 키워드 추출 실패 (로컬 분석으로 전환): {e}")
+                print(f"AI 추출 실패: {e}")
+        
+        # 2. 로컬 모드 (빈도수 기반)
+        raw_words = re.findall(r'[가-힣a-zA-Z]{2,}', script)
+        meaningful_words = []
+        for w in raw_words:
+            # 불용어 필터링
+            if w not in self.STOPWORDS and not any(w.startswith(sw) for sw in self.STOPWORDS if len(sw) > 1):
+                 meaningful_words.append(w)
+        
+        counter = Counter(meaningful_words)
+        
+        # [수정] 동적으로 계산된 target_count만큼 추출
+        extracted_keywords = [word for word, freq in counter.most_common(target_count)]
+        
+        print(f">>> [키워드 추출] 목표 개수: {target_count}개 -> 추출 결과: {extracted_keywords}")
+        return extracted_keywords
         
         # AI 실패 시 로컬 분석
         raw_words = re.findall(r'[가-힣a-zA-Z]{2,}', script)
@@ -53,7 +77,18 @@ class AnalysisManager:
             label = "핵심 전달률"
             if not keywords: return 0, label
             return min(100, int((len(keywords.intersection(trans_set)) / len(keywords)) * 100 * 1.25)), label
-
+    
+    def analyze_speed(self, spm):
+        """SPM 수치에 따라 속도 피드백 텍스트 생성"""
+        if spm == 0:
+            return "⚠️ [속도 분석] 분석할 음성 데이터가 충분하지 않습니다.\n"
+        elif spm < 280:
+            return f"🐢 [속도 분석] 말이 다소 느립니다. ({spm} SPM) 청중이 지루하지 않게 템포를 조금 올려보세요.\n"
+        elif spm > 420:
+            return f"⚡ [속도 분석] 말이 너무 빠릅니다. ({spm} SPM) 핵심 내용에서는 여유를 가지고 천천히 말해보세요.\n"
+        else:
+            return f"✅ [속도 분석] 아주 적절한 발표 속도입니다. ({spm} SPM)\n"
+        
     def analyze_vocal_energy(self, volume_data, mapped_mode):
         """볼륨 데이터의 표준편차로 에너지(역동성) 분석"""
         if not volume_data or len(volume_data) < 2: 
@@ -120,7 +155,7 @@ class AnalysisManager:
         평가 기준:\n{rubric['criteria']}
         
         [자동 분석 데이터]
-        - 속도: {delivery_metrics['wpm']} WPM (적정: 130~150)
+        - 속도: {delivery_metrics['spm']} spM (적정: 300~400 spM)
         - 어조 피드백 (텍스트 기반): "{style_feedback.strip()}"
         - 에너지 피드백 (오디오 기반): "{energy_feedback.strip()}"
         - (정보형) 논리 구조 검증: "{imrad_data}"
