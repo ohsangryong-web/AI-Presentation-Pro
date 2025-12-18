@@ -6,8 +6,6 @@ from PIL import Image, ImageTk
 import threading
 import time
 import numpy as np
-
-# [중요] 반드시 다른 matplotlib import보다 위에 있어야 함
 import matplotlib
 matplotlib.use('TkAgg') 
 import matplotlib.pyplot as plt
@@ -165,7 +163,7 @@ class App(tk.Tk):
             try:
                 if 'app_config' in globals() and hasattr(app_config, 'genai'):
                     app_config.genai.configure(api_key=gemini_key)
-                    self.text_model = app_config.genai.GenerativeModel('gemini-2.5-pro')
+                    self.text_model = app_config.genai.GenerativeModel('gemini-2.5-flash') #2.5-flash
                     self.AI_AVAILABLE = True
                     print("Gemini API 연결 성공")
             except Exception as e:
@@ -209,8 +207,15 @@ class App(tk.Tk):
         self.clear_window()
         frame = ttk.Frame(self)
         frame.pack(expand=True)
-        ttk.Label(frame, text="🎤 AI Presentation Pro", font=("Arial", 30, "bold")).pack(pady=30)
         
+        # 타이틀 (아래 여백을 조금 줄여서 권장 문구와 가깝게 배치)
+        ttk.Label(frame, text="🎤 AI Presentation Pro", font=("Arial", 30, "bold")).pack(pady=(30, 10))
+        
+        # [추가된 부분] 이어폰/헤드셋 권장 문구
+        ttk.Label(frame, text="🎧 정확한 음성 분석&연습을 위해 이어폰이나 헤드셋 사용을 권장합니다.", 
+                  font=("Arial", 12), foreground="#666666").pack(pady=(0, 30))
+        
+        # 기존 버튼 및 드롭다운 코드 유지
         ttk.Label(frame, text="발표 유형 선택:", font=("Arial", 14)).pack()
         self.atmosphere_var = tk.StringVar(value="📘 정보 전달형 (정확성 중시)")
         modes = ["📘 정보 전달형 (정확성 중시)", "🔥 설득/동기부여형 (에너지 중시)", "🤝 공감/소통형 (밸런스 중시)"]
@@ -224,7 +229,7 @@ class App(tk.Tk):
         self.show_practice_page()
 
     # =========================================================================
-    # [UI 대규모 수정] 화면 상단: 청중/내얼굴 병렬 배치, 하단: 대본 스크롤
+    # [UI 대규모 수정] 화면 상단: 청중(좌) | 나(중앙) | 청중(우) 배치
     # =========================================================================
     def show_practice_page(self):
         self.clear_window()
@@ -233,31 +238,40 @@ class App(tk.Tk):
         main_frame = ttk.Frame(self)
         main_frame.pack(fill='both', expand=True, padx=20, pady=20)
 
-        # --- 상단 영역: 화면 분할 (청중 | 내 얼굴) ---
+        # --- 상단 영역: 화면 분할 (청중1 | 나 | 청중2) ---
         top_frame = ttk.Frame(main_frame)
         top_frame.pack(side='top', fill='both', expand=True, pady=(0, 10))
         
-        # 상단 그리드 설정 (1행 2열, 균등 비율)
-        top_frame.columnconfigure(0, weight=1) # 청중 영역
-        top_frame.columnconfigure(1, weight=1) # 내 얼굴 영역
+        # 상단 그리드 설정 (1행 3열)
+        # 0: 청중1, 1: 나(카메라), 2: 청중2
+        top_frame.columnconfigure(0, weight=1) 
+        top_frame.columnconfigure(1, weight=2) # 중앙 사용자 화면을 더 넓게
+        top_frame.columnconfigure(2, weight=1)
         top_frame.rowconfigure(0, weight=1)
 
-        # 1. 청중 패널 (왼쪽)
-        self.audience_frame = tk.Frame(top_frame, bg="#e9ecef", bd=2, relief="sunken")
-        self.audience_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        # 1. 청중 패널 1 (왼쪽)
+        self.aud_left_frame = tk.Frame(top_frame, bg="#e9ecef", bd=2, relief="sunken")
+        self.aud_left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         
-        # 청중 이미지가 중앙에 오도록 내부 프레임 사용
-        aud_inner = tk.Frame(self.audience_frame, bg="#e9ecef")
-        aud_inner.pack(expand=True)
-        self.aud_labels = [ttk.Label(aud_inner) for _ in range(2)]
-        for lbl in self.aud_labels: lbl.pack(side="left", padx=5)
+        self.aud_label_left = ttk.Label(self.aud_left_frame)
+        self.aud_label_left.pack(expand=True)
 
-        # 2. 내 얼굴 패널 (오른쪽)
+        # 2. 내 얼굴 패널 (중앙)
         video_bg_frame = tk.Frame(top_frame, bg="black", bd=2, relief="sunken")
-        video_bg_frame.grid(row=0, column=1, sticky="nsew")
+        video_bg_frame.grid(row=0, column=1, sticky="nsew", padx=5)
         
         self.video_panel = ttk.Label(video_bg_frame)
         self.video_panel.pack(expand=True)
+
+        # 3. 청중 패널 2 (오른쪽)
+        self.aud_right_frame = tk.Frame(top_frame, bg="#e9ecef", bd=2, relief="sunken")
+        self.aud_right_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        
+        self.aud_label_right = ttk.Label(self.aud_right_frame)
+        self.aud_label_right.pack(expand=True)
+
+        # 청중 라벨 리스트 관리 (update_audience_images 함수와의 호환성을 위해 리스트로 저장)
+        self.aud_labels = [self.aud_label_left, self.aud_label_right]
 
         # 초기 청중 이미지 설정
         self.update_audience_images('default', 'default') 
@@ -466,17 +480,14 @@ class App(tk.Tk):
                             script_gaze_detected = True
                             # 시각적 피드백
                             cv2.putText(frame, "LOOKING DOWN!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                            cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 0, 255), -1)
-                            cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 0, 255), -1)
+                           # cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 0, 255), -1)
+                           # cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 0, 255), -1)
                         else:
                             # 정면 응시
-                            cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 255, 0), -1)
-                            cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 255, 0), -1)
-                        
-                        # 눈 윤곽선
-                        cv2.polylines(frame, [mesh_points[[33, 133]]], True, (200, 200, 200), 1)
-                        cv2.polylines(frame, [mesh_points[[362, 263]]], True, (200, 200, 200), 1)
-
+                            #cv2.circle(frame, tuple(mesh_points[468]), 3, (0, 255, 0), -1)
+                            #cv2.circle(frame, tuple(mesh_points[473]), 3, (0, 255, 0), -1)
+                            pass
+                        #눈깔 색 삭제
 
                     # 데이터 집계
                     if is_recording:
@@ -777,7 +788,7 @@ class App(tk.Tk):
             self.after(0, self.show_analysis_page)
 
     # =========================================================================
-    # [수정됨] 분석 페이지: 감점 로직 반영
+    # [수정됨] 분석 페이지: 감점 로직 반영 & 유창성 설명 추가
     # =========================================================================
     def show_analysis_page(self):
         self.clear_window()
@@ -845,7 +856,7 @@ class App(tk.Tk):
             clean_trans = clean_text(current_transcript)
             matcher = difflib.SequenceMatcher(None, clean_script, clean_trans)
             raw_score = matcher.ratio() * 100
-            match_rate = int(raw_score * 1.05) 
+            match_rate = int(raw_score * 1.05) # 약간의 보정
             if match_rate > 100: match_rate = 100
             match_label_text = "전달률"
         else:
@@ -876,7 +887,8 @@ class App(tk.Tk):
         self.create_stat_card(summary, 0, f"🗣️ 속도 ({speed_eval})", f"{spm} SPM", score_speed)
         self.create_stat_card(summary, 1, f"📝 {match_label_text}", f"{match_rate}%", match_rate)
         self.create_stat_card(summary, 2, "👀 시선 처리", f"{final_gaze_score}점", final_gaze_score)
-        self.create_stat_card(summary, 3, "🌊 유창성", f"{score_fluency}점", score_fluency)
+        # [수정됨] 유창성 설명 추가
+        self.create_stat_card(summary, 3, "🌊 유창성\n(필러워 횟수, 말 공백으로 평가)", f"{score_fluency}점", score_fluency)
         
         try:
             self.create_video_player(content)
@@ -893,7 +905,6 @@ class App(tk.Tk):
         ttk.Button(content, text="처음으로 돌아가기", command=self.show_setup_page).pack(pady=30)
         self.load_video()
 
-        
     def create_stat_card(self, parent, col, title, value, score):
         frame = tk.Frame(parent, bg="white", bd=1, relief="solid")
         frame.grid(row=0, column=col, padx=10, sticky="nsew")
